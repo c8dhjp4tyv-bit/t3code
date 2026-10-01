@@ -2,6 +2,7 @@ import * as Arr from "effect/Array";
 import * as Cache from "effect/Cache";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
+import * as ByteSize from "effect/ByteSize";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -29,9 +30,17 @@ import {
   type VcsStatusRemoteResult,
   VcsStatusResult,
   ModelSelection,
+  type ProjectId,
   SourceControlProviderError,
+  type SourceControlProviderKind,
   type SourceControlWritingStyleSettings,
+  type ThreadId,
 } from "@t3tools/contracts";
+import {
+  hasProjectSettingsOverrides,
+  resolveProjectSettings,
+} from "@t3tools/shared/projectSettings";
+import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import {
   detectSourceControlProviderFromGitRemoteUrl,
   mergeGitStatusParts,
@@ -136,6 +145,12 @@ const STATUS_RESULT_CACHE_CAPACITY = 2_048;
 // exponentially via prLookupFailureTtl, so throttling pressure still drops
 // under 429s instead of amplifying it.
 const PR_LOOKUP_CACHE_TTL = Duration.seconds(60);
+// Answers without an open PR ("no PR yet", merged, closed) only change when
+// someone opens a PR, and the paths that do that in-app (turn end, push,
+// create PR, user refresh) bypass this cache. Re-asking every minute for each
+// idle branch was the bulk of background GitHub quota use, so these wait out
+// a longer TTL and a PR opened outside the app shows up within minutes.
+const PR_LOOKUP_NO_OPEN_PR_CACHE_TTL = Duration.minutes(5);
 const PR_LOOKUP_FAILURE_BASE_TTL = Duration.seconds(20);
 const PR_LOOKUP_FAILURE_MAX_TTL = Duration.minutes(15);
 const PR_LOOKUP_CACHE_CAPACITY = 2_048;
@@ -274,7 +289,10 @@ function resolvePullRequestWorktreeLocalBranchName(
   return `t3code/pr-${pullRequest.number}/${suffix}`;
 }
 
-function parseRepositoryNameWithOwnerFromRemoteUrl(url: string | null): string | null {
+export function parseRepositoryNameWithOwnerFromRemoteUrl(
+  url: string | null,
+  providerKind?: ChangeRequest["provider"],
+): string | null {
   const trimmed = url?.trim() ?? "";
   if (trimmed.length === 0) {
     return null;
@@ -285,6 +303,12 @@ function parseRepositoryNameWithOwnerFromRemoteUrl(url: string | null): string |
       trimmed,
     );
   const repositoryNameWithOwner = match?.[1]?.trim() ?? "";
+  // Forgejo HTTP paths can include an installation mount; its API always names owner/repo.
+  if (providerKind === "forgejo" && /^https?:\/\//iu.test(trimmed)) {
+    return repositoryNameWithOwner.length > 0
+      ? repositoryNameWithOwner.split("/").slice(-2).join("/")
+      : null;
+  }
   return repositoryNameWithOwner.length > 0 ? repositoryNameWithOwner : null;
 }
 
@@ -575,6 +599,26 @@ function parseCustomCommitMessage(raw: string): { subject: string; body: string 
   };
 }
 
+// Without the owner selector, a bare branch name also lists same-named
+// branches on other forks (`main`, `patch-1`), so GitHub probes ask for a full
+// page and let matchesBranchHeadContext pick the right head. gh fetches up to
+// 100 in one request, and GitHub prices a first:100 connection like first:1.
+const GITHUB_HEAD_BRANCH_PROBE_LIMIT = 100;
+
+// `gh pr list --head` filters on the head ref name alone and accepts anything, so an
+// `owner:branch` or `remote:branch` selector silently lists zero pull requests
+// while spending a GraphQL call. Git branch names cannot contain ":", and the
+// bare head branch is always among the selectors, so GitHub probes skip them and
+// leave the owner check to matchesBranchHeadContext.
+function probeableHeadSelectors(
+  providerKind: SourceControlProviderKind,
+  headSelectors: ReadonlyArray<string>,
+): ReadonlyArray<string> {
+  return providerKind === "github"
+    ? headSelectors.filter((selector) => !selector.includes(":"))
+    : headSelectors;
+}
+
 function appendUnique(values: string[], next: string | null | undefined): void {
   const trimmed = next?.trim() ?? "";
   if (trimmed.length === 0 || values.includes(trimmed)) {
@@ -665,6 +709,28 @@ export const make = Effect.gen(function* () {
 
   const sourceControlProvider = (cwd: string) => sourceControlProviders.resolve({ cwd });
   const serverSettingsService = yield* ServerSettings.ServerSettingsService;
+  // Optional: git actions also run from the CLI and tests without orchestration.
+  const projectionQuery = yield* Effect.serviceOption(
+    ProjectionSnapshotQuery.ProjectionSnapshotQuery,
+  );
+  /** Environment settings with the acting project's overrides applied. */
+  const projectSettingsFor = Effect.fnUntraced(function* (input: {
+    readonly cwd: string;
+    readonly threadId?: ThreadId | undefined;
+  }) {
+    const settings = yield* serverSettingsService.getSettings;
+    if (!hasProjectSettingsOverrides(settings) || Option.isNone(projectionQuery)) return settings;
+    const projectId = yield* (
+      input.threadId !== undefined
+        ? projectionQuery.value
+            .getThreadShellById(input.threadId)
+            .pipe(Effect.map(Option.map((thread) => thread.projectId)))
+        : projectionQuery.value
+            .getActiveProjectByWorkspaceRoot(input.cwd)
+            .pipe(Effect.map(Option.map((project) => project.id)))
+    ).pipe(Effect.orElseSucceed(() => Option.none<ProjectId>()));
+    return resolveProjectSettings(settings, Option.getOrNull(projectId)).settings;
+  });
   const readRepositoryInstructions = (cwd: string, fileName: string) =>
     Effect.gen(function* () {
       const root = yield* fileSystem.realPath(cwd);
@@ -673,7 +739,7 @@ export const make = Effect.gen(function* () {
         return "";
       }
       const info = yield* fileSystem.stat(instructionPath);
-      if (info.type !== "File" || info.size > FileSystem.Size(20_000)) {
+      if (info.type !== "File" || info.size > ByteSize.bytes(20_000)) {
         return "";
       }
       return (yield* fileSystem.readFileString(instructionPath)).trim();
@@ -980,9 +1046,9 @@ export const make = Effect.gen(function* () {
       Effect.flatMap((cacheKey) => Cache.invalidate(localStatusResultCache, cacheKey)),
     );
   // PR lookups hit the hosting provider's API (gh/glab/...), so definitive
-  // results refresh on the slower PR_LOOKUP_CACHE_TTL cadence. An unresolved
-  // provider starts at the shorter failure cadence and backs off while it stays
-  // unresolved, capped at the healthy lookup cadence. Git actions and
+  // results refresh on their slower cadence, with a longer TTL without an open
+  // PR. An unresolved provider starts at the shorter failure cadence and backs
+  // off while it stays unresolved, capped at the open-PR cadence. Git actions and
   // user-driven refreshes bump the epoch (invalidateStatus) to bypass the cache
   // immediately.
   const prLookupEpochByCwd = new Map<string, number>();
@@ -1081,7 +1147,9 @@ export const make = Effect.gen(function* () {
             return Duration.min(nextPrLookupFailureTtl(key), PR_LOOKUP_CACHE_TTL);
           }
           prLookupFailureStreakByKey.delete(key);
-          return PR_LOOKUP_CACHE_TTL;
+          return exit.value.outcome.latest?.state === "open"
+            ? PR_LOOKUP_CACHE_TTL
+            : PR_LOOKUP_NO_OPEN_PR_CACHE_TTL;
         }
         return nextPrLookupFailureTtl(key);
       },
@@ -1283,7 +1351,15 @@ export const make = Effect.gen(function* () {
       (yield* readConfigValueNullable(cwd, `remote.${preferredRemoteName}.url`)) ??
       (yield* readConfigValueNullable(cwd, "remote.origin.url"));
 
-    return remoteUrl ? detectSourceControlProviderFromGitRemoteUrl(remoteUrl) : null;
+    const provider = remoteUrl ? detectSourceControlProviderFromGitRemoteUrl(remoteUrl) : null;
+    if (!remoteUrl || provider?.kind !== "unknown") return provider;
+    const handle = yield* sourceControlProviders
+      .resolveHandle({
+        cwd,
+        context: { provider, remoteName: preferredRemoteName, remoteUrl },
+      })
+      .pipe(Effect.orElseSucceed(() => null));
+    return handle?.context?.provider ?? provider;
   });
 
   const resolveRemoteRepositoryContext = Effect.fn("resolveRemoteRepositoryContext")(function* (
@@ -1299,7 +1375,22 @@ export const make = Effect.gen(function* () {
     }
 
     const remoteUrl = yield* readConfigValueNullable(cwd, `remote.${remoteName}.url`);
-    const repositoryNameWithOwner = parseRepositoryNameWithOwnerFromRemoteUrl(remoteUrl);
+    let repositoryNameWithOwner = parseRepositoryNameWithOwnerFromRemoteUrl(remoteUrl);
+    if (
+      remoteUrl !== null &&
+      /^https?:\/\//iu.test(remoteUrl) &&
+      (repositoryNameWithOwner?.split("/").length ?? 0) > 2
+    ) {
+      const detected = detectSourceControlProviderFromGitRemoteUrl(remoteUrl);
+      const kind =
+        detected?.kind === "unknown"
+          ? yield* sourceControlProvider(cwd).pipe(
+              Effect.map((provider) => provider.kind),
+              Effect.orElseSucceed(() => undefined),
+            )
+          : detected?.kind;
+      repositoryNameWithOwner = parseRepositoryNameWithOwnerFromRemoteUrl(remoteUrl, kind);
+    }
     return {
       remoteUrlKey: remoteUrl ? normalizeGitRemoteUrl(remoteUrl) : null,
       repositoryNameWithOwner,
@@ -1555,12 +1646,14 @@ export const make = Effect.gen(function* () {
       | "isCrossRepository"
     >,
   ) {
-    for (const headSelector of headContext.headSelectors) {
-      const pullRequests = yield* (yield* sourceControlProvider(cwd)).listChangeRequests({
+    const provider = yield* sourceControlProvider(cwd);
+    const headSelectors = probeableHeadSelectors(provider.kind, headContext.headSelectors);
+    for (const headSelector of headSelectors) {
+      const pullRequests = yield* provider.listChangeRequests({
         cwd,
         headSelector,
         state: "open",
-        limit: 1,
+        limit: provider.kind === "github" ? GITHUB_HEAD_BRANCH_PROBE_LIMIT : 1,
       });
       const normalizedPullRequests = pullRequests.map(toPullRequestInfo);
 
@@ -1589,12 +1682,12 @@ export const make = Effect.gen(function* () {
     }
     const parsedByNumber = new Map<number, PullRequestInfo>();
 
-    for (const headSelector of headContext.headSelectors) {
+    for (const headSelector of probeableHeadSelectors(provider.kind, headContext.headSelectors)) {
       const pullRequests = yield* provider.listChangeRequests({
         cwd,
         headSelector,
         state: "all",
-        limit: 20,
+        limit: provider.kind === "github" ? GITHUB_HEAD_BRANCH_PROBE_LIMIT : 20,
       });
 
       for (const pr of pullRequests.map(toPullRequestInfo)) {
@@ -2028,7 +2121,7 @@ export const make = Effect.gen(function* () {
         title: generated.title,
         bodyFile,
       })
-      .pipe(Effect.ensuring(fileSystem.remove(bodyFile).pipe(Effect.catch(() => Effect.void))));
+      .pipe(Effect.ensuring(fileSystem.remove(bodyFile).pipe(Effect.ignore)));
 
     const created = yield* findOpenPr(cwd, headContext);
     if (!created) {
@@ -2155,11 +2248,13 @@ export const make = Effect.gen(function* () {
     });
     if (options?.refresh) {
       // A completed turn can create a PR or reuse a merged PR's branch.
-      // Refresh successful answers, but keep failed lookups' retry backoff.
+      // Refresh definitive answers, but keep failed or unknown lookups' retry backoff.
       const cached = yield* Cache.getOption(prLookupCache, cacheKey).pipe(
         Effect.orElseSucceed(() => Option.none()),
       );
-      if (Option.isSome(cached)) yield* Cache.invalidate(prLookupCache, cacheKey);
+      if (Option.isSome(cached) && cached.value.outcome._tag === "Complete") {
+        yield* Cache.invalidate(prLookupCache, cacheKey);
+      }
     }
     let cached = yield* Cache.get(prLookupCache, cacheKey);
     if (cached.outcome._tag === "ProviderUnknown") return null;
@@ -2508,11 +2603,20 @@ export const make = Effect.gen(function* () {
         });
       }
 
-      const worktree = yield* gitCore.createWorktree({
-        cwd: input.cwd,
-        refName: localPullRequestBranch,
-        path: null,
-      });
+      const worktree = yield* gitCore.createWorktree(
+        {
+          cwd: input.cwd,
+          refName: localPullRequestBranch,
+          path: null,
+        },
+        {
+          // Best effort: a settings read failure falls back to the checkout's t3.json.
+          submodules: yield* projectSettingsFor(input).pipe(
+            Effect.map((settings) => settings.worktreeSubmodules),
+            Effect.orElseSucceed(() => null),
+          ),
+        },
+      );
       yield* ensureExistingWorktreeUpstream(worktree.worktree.path);
       yield* maybeRunSetupScript(worktree.worktree.path);
 
@@ -2627,7 +2731,7 @@ export const make = Effect.gen(function* () {
         let commitMessageForStep = input.commitMessage;
         let preResolvedCommitSuggestion: CommitAndBranchSuggestion | undefined = undefined;
 
-        const textGenerationSettings = yield* serverSettingsService.getSettings.pipe(
+        const textGenerationSettings = yield* projectSettingsFor(input).pipe(
           Effect.flatMap((settings) =>
             settings.sourceControlWriterModelSelection === null
               ? Effect.succeed({
